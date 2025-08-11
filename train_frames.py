@@ -24,6 +24,15 @@ from utils.image_utils import psnr
 from utils.debug_utils import save_tensor_img
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
+
+from gating.roi_gate import weighted_residual_lowres, top_tiles, tiles_to_gaussians
+from render.tile_index_cache import TileIndexCache
+from opt.b2rs import primal_dual_step
+from opt.manifolds import so3_update, spd_update, barrier_sigma
+from dyn.ot_transport import sinkhorn_transport
+from utils.timebudget import TimeBudget
+
+
 import re
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -328,15 +337,61 @@ def train_frames(lp, op, pp, args):
     if args.frame_start==1:
         args.load_iteration = args.first_load_iteration
     for frame in frames:
-        start_time = time.time()
-        args.source_path = os.path.join(video_path, frame)
-        args.output_path = os.path.join(output_path, frame)
-        args.model_path = model_path
-        train_one_frame(lp,op,pp,args)
-        print(f"Frame {frame} finished in {time.time()-start_time} seconds.")
-        model_path = args.output_path
-        args.load_iteration = load_iteration
-        torch.cuda.empty_cache()
+        if args.rt_enable:
+            # 0) 저해상 준비
+            with torch.cuda.stream(S_res):
+                frames_low = [downsample(v, s=4) for v in multiview_frames]        # [V, H', W', 3]
+                pred_low   = render_lowres(G_stable, cams, frames_low)             # fast predict
+                R = weighted_residual_lowres(frames_low, pred_low, cams, use_epipolar=args.rt_epipolar)  # [H',W']
+
+                tile_cache.build_or_update(G_stable, cams, R.shape, changed_tiles=None)
+                mask = top_tiles(R, tile=args.rt_tile, top_p=args.rt_top_p)        # [Th, Tw]
+                cand_ids = tiles_to_gaussians(mask, tile_cache)                    # [K]
+
+                # 타일별 잔차/시간비용 벡터화
+                Rb = tile_average(R, args.rt_tile).flatten()                       # [Th*Tw]
+                tc = estimate_time_cost_per_tile(mask)                             # heuristic or const
+
+                # 1) B²RS: primal–dual (1~2 steps)
+                z, mu = primal_dual_step(z, Rb, tc, args.rt_budget_ms, mu=mu, eta_z=0.5, eta_mu=0.5)
+
+            # 2) 업데이트
+            timebudget.begin()
+            with torch.cuda.stream(S_upd):
+                S_ids = tiles_to_gaussians((z.view_as(mask) > 0.5), tile_cache)
+
+                # (a) fast path every frame: position & opacity (1–2 steps)
+                step_mu_alpha(G_staging, S_ids, lr_mu, lr_alpha, trust_region=True)
+
+                # (b) periodic: cov & SH (manifold)
+                if frame_idx % args.rt_periodic_cov_sh == 0:
+                    dS, dR, dSH = grads_cov_R_SH(G_staging, S_ids)
+                    G_staging.R[S_ids] = so3_update(G_staging.R[S_ids], dR)
+                    G_staging.Sigma[S_ids] = spd_update(G_staging.Sigma[S_ids], dS)
+                    loss_barrier = barrier_sigma(G_staging.Sigma[S_ids])
+                    # add loss_barrier to your optimizer step if using autograd path
+
+                # (c) optional OT spawn/cull (only if time left)
+                if args.rt_enable_ot and timebudget.left_ms() > args.rt_spawn_thresh_ms:
+                    C = mahalanobis_cost_tiles_to_gaussians(R, G_staging, cams)    # [P,M]
+                    Pi = sinkhorn_transport(residual_mass(R), C, eps=0.05, iters=3)
+                    spawn_from_transport(Pi, G_staging)
+                    cull_low_contrib(G_staging, window=5)
+
+            # 3) 렌더/스왑
+            with torch.cuda.stream(S_ren):
+                render_present(G_stable)  # double-buffer stable params
+            swap_if_ready(G_staging, G_stable)
+        else:
+            start_time = time.time()
+            args.source_path = os.path.join(video_path, frame)
+            args.output_path = os.path.join(output_path, frame)
+            args.model_path = model_path
+            train_one_frame(lp,op,pp,args)
+            print(f"Frame {frame} finished in {time.time()-start_time} seconds.")
+            model_path = args.output_path
+            args.load_iteration = load_iteration
+            torch.cuda.empty_cache()
         
 
 if __name__ == "__main__":
@@ -359,6 +414,18 @@ if __name__ == "__main__":
     parser.add_argument("--start_checkpoint", type=str, default = None)
     parser.add_argument("--read_config", action='store_true', default=False)
     parser.add_argument("--config_path", type=str, default = None)
+
+    parser.add_argument("--rt_enable", action='store_true', type=bool, default=False)
+    parser.add_argument("--rt_budget_ms", type=float, default=10.0)
+    parser.add_argument("--rt_tile", type=int, default=16)
+    parser.add_argument("--rt_top_p", type=float, default=0.01)
+    parser.add_argument("--rt_epipolar", type=bool, default=True)
+    parser.add_argument("--rt_pd_steps", type=int, default=1)
+    parser.add_argument("--rt_periodic_cov_sh", type=int, default=3)
+    parser.add_argument("--rt_enable_ot", action='store_true', type=bool, default=False)
+    parser.add_argument("--rt_spawn_thresh_ms", type=float, default=2.0)
+    parser.add_argument("--rt_disable_sh_rotation", action='store_true', default=True)
+
     args = parser.parse_args(sys.argv[1:])
     if args.output_path == "":
         args.output_path=args.model_path
@@ -374,4 +441,11 @@ if __name__ == "__main__":
     with open(os.path.join(args.output_path, "cfg_args.json"), 'w') as f:
         f.write(json_namespace)
     # train_one_frame(lp,op,pp,args)
+
+    S_cap, S_res, S_upd, S_ren = [torch.cuda.Stream() for _ in range(4)]
+    tile_cache = TileIndexCache(args.rt_tile)
+    z = torch.zeros((H//args.rt_tile) * (W//args.rt_tile), device=device)
+    mu = None
+    timebudget = TimeBudget(args.rt_budget_ms)
+
     train_frames(lp,op,pp,args)
